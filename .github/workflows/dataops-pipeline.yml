@@ -4,11 +4,18 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'notebooks/**'       # Triggers when notebooks change
-      - 'data_quality/**'    # Triggers when quality rules change
-      - 'sample_data/**'     # Triggers when data changes
+      - 'notebooks/**'
+      - 'data_quality/**'
+      - 'sample_data/**'
+      - '.github/workflows/**'
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual run'
+        required: false
+        default: 'Manual trigger'
 
 env:
   DATABRICKS_HOST: https://dbc-8e912ed6-1406.cloud.databricks.com
@@ -17,8 +24,6 @@ env:
 jobs:
 
   # ── JOB 1: DATA QUALITY GATE ──────────────────────────────
-  # Runs FIRST — pipeline stops here if data fails checks
-  # Equivalent of Bandit/Trivy in your DevSecOps pipeline
   data-quality-gate:
     name: Data Quality Validation
     runs-on: ubuntu-latest
@@ -40,23 +45,19 @@ jobs:
 
       - name: Run data quality checks
         run: python data_quality/validate_data.py
-        # Exit code 1 from this script blocks entire pipeline
-        # Equivalent to Trivy blocking on critical CVEs
 
       - name: Upload quality report
         uses: actions/upload-artifact@v4
-        if: always()    # Upload even if checks fail — for investigation
+        if: always()
         with:
           name: data-quality-report
           path: data_quality/
 
   # ── JOB 2: DEPLOY NOTEBOOKS ───────────────────────────────
-  # Only runs if Job 1 (data quality) passes
-  # Deploys updated notebooks to Databricks workspace
   deploy-notebooks:
     name: Deploy Notebooks to Databricks
     runs-on: ubuntu-latest
-    needs: data-quality-gate    # Hard dependency — quality must pass first
+    needs: data-quality-gate
 
     steps:
       - name: Checkout code
@@ -71,9 +72,10 @@ jobs:
 
       - name: Configure Databricks CLI
         run: |
-          databricks configure --token << EOF
-          ${{ env.DATABRICKS_HOST }}
-          ${{ secrets.DATABRICKS_TOKEN }}
+          cat > ~/.databrickscfg << EOF
+          [DEFAULT]
+          host = ${{ env.DATABRICKS_HOST }}
+          token = ${{ secrets.DATABRICKS_TOKEN }}
           EOF
 
       - name: Create workspace folders
@@ -115,12 +117,10 @@ jobs:
           databricks workspace list /gmmco-poc/gold
 
   # ── JOB 3: TRIGGER DATABRICKS PIPELINE ───────────────────
-  # Only runs if Job 2 (deploy) passes
-  # Triggers the Databricks job that runs Bronze → Silver → Gold
   trigger-pipeline:
     name: Trigger Databricks Pipeline Run
     runs-on: ubuntu-latest
-    needs: deploy-notebooks    # Notebooks must be deployed first
+    needs: deploy-notebooks
 
     steps:
       - name: Install Databricks CLI
@@ -131,44 +131,58 @@ jobs:
 
       - name: Configure Databricks CLI
         run: |
-          databricks configure --token << EOF
-          ${{ env.DATABRICKS_HOST }}
-          ${{ secrets.DATABRICKS_TOKEN }}
+          cat > ~/.databrickscfg << EOF
+          [DEFAULT]
+          host = ${{ env.DATABRICKS_HOST }}
+          token = ${{ secrets.DATABRICKS_TOKEN }}
           EOF
 
-      - name: Run Databricks pipeline job
+      - name: Trigger and wait for pipeline
         run: |
-          RUN_ID=$(databricks jobs run-now \
+          echo "Triggering GMMCO DataOps pipeline..."
+          
+          RUN_OUTPUT=$(databricks jobs run-now \
             --job-id ${{ secrets.DATABRICKS_JOB_ID }} \
-            --output json | python3 -c \
+            --output json)
+          
+          RUN_ID=$(echo $RUN_OUTPUT | python3 -c \
             "import sys,json; print(json.load(sys.stdin)['run_id'])")
-          echo "Pipeline run triggered. Run ID: $RUN_ID"
-          echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
-
-      - name: Wait for pipeline completion
-        run: |
-          echo "Waiting for run $RUN_ID to complete..."
-          databricks runs wait $RUN_ID
           
-          # Get final status
-          STATUS=$(databricks runs get \
-            --run-id $RUN_ID \
-            --output json | python3 -c \
-            "import sys,json
+          echo "Run ID: $RUN_ID"
+          echo "Waiting for completion..."
+          
+          # Poll every 30 seconds
+          for i in {1..20}; do
+            sleep 30
+            
+            STATUS=$(databricks runs get \
+              --run-id $RUN_ID \
+              --output json | python3 -c "
+          import sys,json
           d=json.load(sys.stdin)
-          print(d['state']['result_state'])")
+          state=d.get('state',{})
+          lc=state.get('life_cycle_state','')
+          rs=state.get('result_state','')
+          print(f'{lc}:{rs}')
+          ")
           
-          echo "Pipeline result: $STATUS"
+            echo "Status: $STATUS"
           
-          if [ "$STATUS" != "SUCCESS" ]; then
-            echo "Pipeline FAILED — check Databricks run $RUN_ID"
-            exit 1
-          fi
+            if [[ $STATUS == TERMINATED:SUCCESS ]]; then
+              echo "✅ Pipeline completed successfully"
+              exit 0
+            elif [[ $STATUS == TERMINATED:* ]]; then
+              echo "❌ Pipeline failed: $STATUS"
+              exit 1
+            fi
+          done
+          
+          echo "❌ Pipeline timed out after 10 minutes"
+          exit 1
 
       - name: Notify success
         run: |
           echo "✅ DataOps Pipeline Complete"
-          echo "Data quality: 62 checks passed"
-          echo "Notebooks: deployed to Databricks"
-          echo "Pipeline: Bronze → Silver → Gold complete"
-          echo "Dashboard: ready for refresh"
+          echo "  Data quality: passed"
+          echo "  Notebooks: deployed"
+          echo "  Bronze → Silver → Gold: complete"
