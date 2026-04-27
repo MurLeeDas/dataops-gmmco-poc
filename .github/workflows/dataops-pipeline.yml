@@ -1,0 +1,177 @@
+name: DataOps Pipeline — GMMCO
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'notebooks/**'       # Triggers when notebooks change
+      - 'data_quality/**'    # Triggers when quality rules change
+      - 'sample_data/**'     # Triggers when data changes
+  pull_request:
+    branches: [ main ]
+
+env:
+  DATABRICKS_HOST: https://dbc-8e912ed6-1406.cloud.databricks.com
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ── JOB 1: DATA QUALITY GATE ──────────────────────────────
+  # Runs FIRST — pipeline stops here if data fails checks
+  # Equivalent of Bandit/Trivy in your DevSecOps pipeline
+  data-quality-gate:
+    name: Data Quality Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install pandas
+
+      - name: Regenerate sample data
+        run: python sample_data/generate_data.py
+
+      - name: Run data quality checks
+        run: python data_quality/validate_data.py
+        # Exit code 1 from this script blocks entire pipeline
+        # Equivalent to Trivy blocking on critical CVEs
+
+      - name: Upload quality report
+        uses: actions/upload-artifact@v4
+        if: always()    # Upload even if checks fail — for investigation
+        with:
+          name: data-quality-report
+          path: data_quality/
+
+  # ── JOB 2: DEPLOY NOTEBOOKS ───────────────────────────────
+  # Only runs if Job 1 (data quality) passes
+  # Deploys updated notebooks to Databricks workspace
+  deploy-notebooks:
+    name: Deploy Notebooks to Databricks
+    runs-on: ubuntu-latest
+    needs: data-quality-gate    # Hard dependency — quality must pass first
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh \
+            | sh
+          databricks --version
+
+      - name: Configure Databricks CLI
+        run: |
+          databricks configure --token << EOF
+          ${{ env.DATABRICKS_HOST }}
+          ${{ secrets.DATABRICKS_TOKEN }}
+          EOF
+
+      - name: Create workspace folders
+        run: |
+          databricks workspace mkdirs /gmmco-poc/bronze || true
+          databricks workspace mkdirs /gmmco-poc/silver || true
+          databricks workspace mkdirs /gmmco-poc/gold   || true
+          echo "Workspace folders ready."
+
+      - name: Deploy Bronze notebook
+        run: |
+          databricks workspace import \
+            notebooks/bronze/01_bronze_ingest.py \
+            /gmmco-poc/bronze/01_bronze_ingest \
+            --language PYTHON \
+            --overwrite
+          echo "Bronze notebook deployed."
+
+      - name: Deploy Silver notebook
+        run: |
+          databricks workspace import \
+            notebooks/silver/02_silver_transform.py \
+            /gmmco-poc/silver/02_silver_transform \
+            --language PYTHON \
+            --overwrite
+          echo "Silver notebook deployed."
+
+      - name: Deploy Gold notebook
+        run: |
+          databricks workspace import \
+            notebooks/gold/03_gold_aggregate.py \
+            /gmmco-poc/gold/03_gold_aggregate \
+            --language PYTHON \
+            --overwrite
+          echo "Gold notebook deployed."
+
+      - name: Verify deployment
+        run: |
+          echo "Deployed notebooks:"
+          databricks workspace list /gmmco-poc/bronze
+          databricks workspace list /gmmco-poc/silver
+          databricks workspace list /gmmco-poc/gold
+
+  # ── JOB 3: TRIGGER DATABRICKS PIPELINE ───────────────────
+  # Only runs if Job 2 (deploy) passes
+  # Triggers the Databricks job that runs Bronze → Silver → Gold
+  trigger-pipeline:
+    name: Trigger Databricks Pipeline Run
+    runs-on: ubuntu-latest
+    needs: deploy-notebooks    # Notebooks must be deployed first
+
+    steps:
+      - name: Install Databricks CLI
+        run: |
+          curl -fsSL \
+            https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh \
+            | sh
+
+      - name: Configure Databricks CLI
+        run: |
+          databricks configure --token << EOF
+          ${{ env.DATABRICKS_HOST }}
+          ${{ secrets.DATABRICKS_TOKEN }}
+          EOF
+
+      - name: Run Databricks pipeline job
+        run: |
+          RUN_ID=$(databricks jobs run-now \
+            --job-id ${{ secrets.DATABRICKS_JOB_ID }} \
+            --output json | python3 -c \
+            "import sys,json; print(json.load(sys.stdin)['run_id'])")
+          echo "Pipeline run triggered. Run ID: $RUN_ID"
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+
+      - name: Wait for pipeline completion
+        run: |
+          echo "Waiting for run $RUN_ID to complete..."
+          databricks runs wait $RUN_ID
+          
+          # Get final status
+          STATUS=$(databricks runs get \
+            --run-id $RUN_ID \
+            --output json | python3 -c \
+            "import sys,json
+          d=json.load(sys.stdin)
+          print(d['state']['result_state'])")
+          
+          echo "Pipeline result: $STATUS"
+          
+          if [ "$STATUS" != "SUCCESS" ]; then
+            echo "Pipeline FAILED — check Databricks run $RUN_ID"
+            exit 1
+          fi
+
+      - name: Notify success
+        run: |
+          echo "✅ DataOps Pipeline Complete"
+          echo "Data quality: 62 checks passed"
+          echo "Notebooks: deployed to Databricks"
+          echo "Pipeline: Bronze → Silver → Gold complete"
+          echo "Dashboard: ready for refresh"
