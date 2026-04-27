@@ -85,27 +85,24 @@ jobs:
 
       - name: Deploy Bronze notebook
         run: |
-          databricks workspace import \
-            notebooks/bronze/01_bronze_ingest.py \
-            /gmmco-poc/bronze/01_bronze_ingest \
+          databricks workspace import /gmmco-poc/bronze/01_bronze_ingest \
+            --file notebooks/bronze/01_bronze_ingest.py \
             --language PYTHON \
             --overwrite
           echo "Bronze notebook deployed."
 
       - name: Deploy Silver notebook
         run: |
-          databricks workspace import \
-            notebooks/silver/02_silver_transform.py \
-            /gmmco-poc/silver/02_silver_transform \
+          databricks workspace import /gmmco-poc/silver/02_silver_transform \
+            --file notebooks/silver/02_silver_transform.py \
             --language PYTHON \
             --overwrite
           echo "Silver notebook deployed."
 
       - name: Deploy Gold notebook
         run: |
-          databricks workspace import \
-            notebooks/gold/03_gold_aggregate.py \
-            /gmmco-poc/gold/03_gold_aggregate \
+          databricks workspace import /gmmco-poc/gold/03_gold_aggregate \
+            --file notebooks/gold/03_gold_aggregate.py \
             --language PYTHON \
             --overwrite
           echo "Gold notebook deployed."
