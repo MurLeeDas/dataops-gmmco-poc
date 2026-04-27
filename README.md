@@ -1,1 +1,1 @@
-# DataOps POC — GMMCO Data Platform
+# DataOps POC — Enterprise Data CICD Platform
