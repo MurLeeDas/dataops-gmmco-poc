@@ -43,7 +43,10 @@ jobs:
       - name: Regenerate sample data
         run: python sample_data/generate_data.py
 
-      - name: Run data quality checks
+      - name: Schema validation gate
+        run: python data_quality/validate_schema.py
+
+      - name: Data quality checks
         run: python data_quality/validate_data.py
 
       - name: Upload quality report
